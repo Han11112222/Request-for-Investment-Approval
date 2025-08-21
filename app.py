@@ -1,141 +1,94 @@
 import io
 import time
-from datetime import datetime
 import pandas as pd
 import streamlit as st
+import gspread
+from gspread_dataframe import set_with_dataframe
+from google.oauth2.service_account import Credentials
 import plotly.express as px
 
-import gspread
-from google.oauth2.service_account import Credentials
-from gspread_dataframe import set_with_dataframe
+st.set_page_config(page_title="엑셀 → 구글 스프레드시트 자동업데이트", layout="wide")
 
-# -----------------------------
-# 페이지 설정
-# -----------------------------
-st.set_page_config(page_title="배관투자 자동업데이트", layout="wide")
-st.title("엑셀 → 구글 스프레드시트 자동업데이트")
-st.caption("파일 업로드 후 [스프레드시트 업데이트] 버튼을 누르면 지정한 시트에 덮어쓰기 또는 신규 시트로 기록됩니다.")
+# ---- 인증 & 클라이언트 ----
+@st.cache_resource
+def get_gspread_client():
+    sa_info = st.secrets["gcp_service_account"]
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+    return gspread.authorize(creds)
 
-# -----------------------------
-# 구글 인증 및 스프레드시트 접근
-# -----------------------------
-GSHEET_ID = st.secrets["gsheet_id"]
-SERVICE_ACCOUNT_INFO = st.secrets["gcp_service_account"]
-
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-creds = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
-gc = gspread.authorize(creds)
-sh = gc.open_by_key(GSHEET_ID)
-
-# -----------------------------
-# 업로드 UI
-# -----------------------------
-uploaded = st.file_uploader("엑셀 파일 업로드 (.xlsx)", type=["xlsx"])
-
-colA, colB, colC = st.columns([1, 1, 1])
-with colA:
-    write_mode = st.radio("기록 방식", ["덮어쓰기(기존 시트)", "신규 시트 생성"], horizontal=True)
-with colB:
-    target_ws_name = st.text_input("기존/신규 시트명", value="자동업데이트")
-with colC:
-    make_charts = st.toggle("차트 생성", value=True)
-
-# -----------------------------
-# 엑셀 → DataFrame 로드
-# -----------------------------
-def load_excel_to_df(file: io.BytesIO) -> dict:
-    dfs = {}
-    xls = pd.ExcelFile(file, engine="openpyxl")
-    for sheet in xls.sheet_names:
-        df = xls.parse(sheet_name=sheet).dropna(how="all").dropna(axis=1, how="all")
-        dfs[sheet] = df
-    return dfs
-
-def get_or_create_worksheet(spreadsheet, name):
+def get_worksheet(client, spreadsheet_id: str, sheet_name: str):
+    sh = client.open_by_key(spreadsheet_id)
     try:
-        return spreadsheet.worksheet(name)
+        ws = sh.worksheet(sheet_name)
     except gspread.WorksheetNotFound:
-        return spreadsheet.add_worksheet(title=name, rows=1000, cols=26)
-
-def write_df(spreadsheet, ws_name, df: pd.DataFrame):
-    ws = get_or_create_worksheet(spreadsheet, ws_name)
-    ws.clear()
-    set_with_dataframe(ws, df)  # DataFrame을 통째로 시트에 쓰기
+        ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=50)
     return ws
 
-def find_table_for_charts(dfs: dict) -> pd.DataFrame | None:
-    keys = list(dfs.keys())
-    for name in keys:
-        df = dfs[name]
-        cols = [str(c) for c in df.columns]
-        if any(k in "".join(cols) for k in ["계획", "실적", "승인", "금액"]):
-            return df
-    return dfs[keys[0]] if keys else None
+# ---- UI ----
+st.title("엑셀 → 구글 스프레드시트 자동업데이트")
+st.caption("파일 업로드 후 **[스프레드시트 업데이트]** 버튼을 누르면 지정한 시트에 덮어씁니다.")
 
-# -----------------------------
-# 메인 로직
-# -----------------------------
-if uploaded:
-    dfs = load_excel_to_df(uploaded)
-    st.success(f"시트 {len(dfs)}개를 읽었습니다: {', '.join(list(dfs.keys())[:6])} ...")
+gsheet_id = st.secrets["gsheet_id"]
+client = get_gspread_client()
 
-    first = list(dfs.keys())[0]
-    st.subheader("미리보기")
-    st.dataframe(dfs[first].head(30), use_container_width=True)
+col1, col2, col3 = st.columns([1.2, 1, 1])
+with col1:
+    file = st.file_uploader("엑셀(.xlsx) 파일 업로드", type=["xlsx"])
+with col2:
+    target_sheet = st.text_input("기록할 시트 이름", value="자동업데이트")
+with col3:
+    do_backup = st.toggle("업데이트 전 백업 시트 생성", value=True)
 
-    # 구글 시트 업데이트 버튼
-    if st.button("📝 스프레드시트 업데이트", type="primary", use_container_width=True):
-        with st.spinner("구글 스프레드시트에 쓰는 중..."):
-            written = []
-            base_ws = (target_ws_name or "자동업데이트").strip()
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+# ---- 파일 처리 ----
+df = None
+if file is not None:
+    # 여러 시트가 있는 경우 첫 번째 시트 사용 (필요하면 sheet_name= 옵션 바꿔도 OK)
+    df = pd.read_excel(io.BytesIO(file.read()))
+    st.success(f"업로드 완료: {file.name} · {df.shape[0]}행 × {df.shape[1]}열")
+    with st.expander("미리보기", expanded=True):
+        st.dataframe(df, use_container_width=True)
 
-            for sheet_name, df in dfs.items():
-                ws_name = base_ws if write_mode.startswith("덮어쓰기") else f"{base_ws}_{sheet_name}_{timestamp}"
-                write_df(sh, ws_name, df)
-                written.append(ws_name)
-                time.sleep(0.2)
+    # 간단 그래프 예시(열 이름에 맞게 자동 탐색)
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    if len(numeric_cols) >= 1:
+        st.subheader("막대 그래프 (첫 번째 숫자열 기준 상위 10)")
+        top = df.nlargest(10, numeric_cols[0])
+        fig1 = px.bar(top, x=top.columns[0], y=numeric_cols[0], title=f"{numeric_cols[0]} 상위 10")
+        st.plotly_chart(fig1, use_container_width=True)
 
-        st.success(f"업데이트 완료: {', '.join(written[:6])} ...")
-        st.link_button("스프레드시트 열기", f"https://docs.google.com/spreadsheets/d/{GSHEET_ID}", use_container_width=True)
+    if len(numeric_cols) >= 1:
+        st.subheader("도넛 차트 (첫 번째 숫자열 합계 기준)")
+        # 범주형 첫 컬럼과 첫 숫자열로 집계
+        cat_col = df.columns[0]
+        pie_data = df.groupby(cat_col, as_index=False)[numeric_cols[0]].sum().nlargest(6, numeric_cols[0])
+        fig2 = px.pie(pie_data, names=cat_col, values=numeric_cols[0], hole=0.55, title=f"{cat_col}별 {numeric_cols[0]} 비율")
+        st.plotly_chart(fig2, use_container_width=True)
 
-    # 차트 생성
-    if make_charts:
-        st.subheader("투자계획/실적 & 승인 비율 대시보드")
-        chart_df = find_table_for_charts(dfs).copy()
+# ---- 구글 시트 업데이트 ----
+if st.button("스프레드시트 업데이트", type="primary", disabled=(df is None)):
+    try:
+        ws = get_worksheet(client, gsheet_id, target_sheet)
 
-        cols = list(chart_df.columns)
-        cat_col = next((c for c in cols if any(k in str(c) for k in ["구분", "항목", "분류", "계정"])), cols[0])
+        # 백업(선택): 기존 시트를 복제하여 타임스탬프 백업
+        if do_backup:
+            sh = client.open_by_key(gsheet_id)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            sh.duplicate_sheet(
+                source_sheet_id=ws._properties["sheetId"],
+                new_sheet_name=f"{target_sheet}_backup_{ts}"
+            )
 
-        # 숫자열 변환
-        for c in cols:
-            chart_df[c] = pd.to_numeric(chart_df[c], errors="ignore")
-        num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(chart_df[c])]
+        # 시트 비우고 덮어쓰기
+        ws.clear()
+        set_with_dataframe(ws, df)
+        st.success(f"✅ '{target_sheet}' 시트에 {df.shape[0]}행 {df.shape[1]}열 업데이트 완료!")
+    except gspread.exceptions.APIError as e:
+        st.error(f"Google API 오류: {e}")
+    except Exception as e:
+        st.error(f"업데이트 실패: {e}")
 
-        plan_col = next((c for c in num_cols if "계획" in str(c)), None)
-        actual_col = next((c for c in num_cols if "실적" in str(c)), None)
-        if plan_col is None and len(num_cols) >= 2:
-            plan_col, actual_col = num_cols[:2]
-
-        # 막대그래프
-        bar_df = chart_df[[cat_col, plan_col, actual_col]].dropna()
-        bar_df = bar_df.rename(columns={cat_col: "항목", plan_col: "계획", actual_col: "실적"})
-        fig_bar = px.bar(
-            bar_df.melt(id_vars="항목", value_vars=["계획", "실적"], var_name="구분", value_name="값"),
-            x="값", y="항목", color="구분", barmode="group", orientation="h",
-            title="투자계획(사업계획) vs 실적"
-        )
-        fig_bar.update_layout(height=500, legend_title_text="")
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-        # 도넛그래프
-        ratio_source = next((c for c in cols if "승인" in str(c) and pd.api.types.is_numeric_dtype(chart_df[c])), None)
-        pie_df = chart_df[[cat_col, ratio_source or plan_col]].rename(columns={cat_col: "항목", (ratio_source or plan_col): "값"}).dropna()
-        fig_pie = px.pie(pie_df, names="항목", values="값", hole=0.6, title="배관투자 승인 비율(가중치 기준)")
-        fig_pie.update_layout(height=520)
-        st.plotly_chart(fig_pie, use_container_width=True)
-else:
-    st.info("엑셀(.xlsx)을 업로드하면 미리보기와 차트가 표시되고, 버튼으로 구글 시트에 반영됩니다.")
+st.caption("※ 시트 공유: 서비스계정 이메일을 구글 시트 **편집자**로 공유해야 합니다.")
